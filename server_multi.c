@@ -7,6 +7,9 @@
 #include <time.h>
 #include <openssl/evp.h>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 
 
 #define PORT 8080
@@ -14,16 +17,31 @@
 #define LOG_FILE "server.log"
 #define MAX_REQUESTS_PER_SEC 5
 
-#define VALID_USERNAME "admin"
-#define VALID_PASSWORD_HASH "94e0f9bc7f5a5225bd141bad5adf9befcc112aef09b88f47a14e20b75a7bbec2"
+#define VALID_USERNAME "shahar"
+#define SALT "c3k9_CyberSec2026!$"
+// SHA256("Secret123!" + "c3k9_CyberSec2026!$")
+//PASSWORD  Secret123!
+#define VALID_PASSWORD_HASH "d2447d916f9f2228fcff669ff3a52d4fb090751202233e2c8d20cc533c8d8cef"
 
-void computer_sha256(const char *input, char output_hex[65]){
+#define MAX_FAILED_ATTEMPTS 3
+#define LOCKOUT_TIME_SEC 30
+
+int failed_attempts = 0;
+time_t lockout_start_time = 0;
+pthread_mutex_t auth_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void computer_sha256_with_salt(const char *password, const char *salt, char output_hex[65]){
         unsigned char hash[EVP_MAX_MD_SIZE]; //lock safe for threads
         unsigned int hash_len; //lock safe for logging
 
+        char salted_input[256] = {0};//buffer to put the salt
+
+        snprintf(salted_input, sizeof(salted_input), "%s%s", password, salt);
+
         EVP_MD_CTX *ctx = EVP_MD_CTX_new();
         EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
-        EVP_DigestUpdate(ctx, input, strlen(input));
+
+        EVP_DigestUpdate(ctx,salted_input, strlen(salted_input));
         EVP_DigestFinal_ex(ctx, hash,&hash_len);
         EVP_MD_CTX_free(ctx);
 
@@ -59,7 +77,7 @@ void log_event(const char *level, const char *message){
 }
 
 void *handle_client(void *client_socket_ptr){
-        int new_socket = *(int *)client_socket_ptr;
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout server.key -out server.crt  int new_socke>
         free(client_socket_ptr); //free memory for socket id
 
         char buffer[BUFFER_SIZE] = {0};
@@ -71,7 +89,7 @@ void *handle_client(void *client_socket_ptr){
         int is_authenticated = 0;
 
 //updates when client connects
-        pthread_mutex_lock(&clients_mutex);
+       pthread_mutex_lock(&clients_mutex);
         active_clients++;
         snprintf(log_buff, sizeof(log_buff), "[Thread %ld] Client connected on sock %d. Active client>
  (long)pthread_self(), new_socket, active_clients);
@@ -115,35 +133,85 @@ void *handle_client(void *client_socket_ptr){
                         char username[64] = {0};
                         char password[64] = {0};
 
+                        pthread_mutex_lock(&auth_lock_mutex);
+                        time_t now = time(NULL); //getting current time
+                        //checking max tries
+                       if(failed_attempts >= MAX_FAILED_ATTEMPTS){
+                                //cac how many seconds left out of 30
+                                double seconds_left = LOCKOUT_TIME_SEC - difftime(now, lockout_start_>
+
+                                if (seconds_left >0 ){
+                                        pthread_mutex_unlock(&auth_lock_mutex);
+                                        char reply[128];
+                                        snprintf(reply, sizeof(reply), "Account locked due to mutiple>
+                                                ,seconds_left);
+                                        send(new_socket, reply, strlen(reply), 0);
+
+                                        snprintf(log_buff, sizeof(log_buff), "SECURITY ALLERT: Reject>
+                                        log_event("WARNING", log_buff);
+
+                                        continue;
+                                }else{
+                                // after 30 seconds- reset
+                                failed_attempts = 0;
+                                lockout_start_time = 0;
+                                log_event("INFO", "Lockout period expierd. Accound now is unlocked");
+                                }
+                        }
+                        pthread_mutex_unlock(&auth_lock_mutex);
+
                         if (sscanf(buffer + 6, "%63s %63s", username, password) == 2) {
                                 password[strcspn(password, "\r\n")] = 0;
                                 username[strcspn(username, "\r\n")] = 0;
 
                                 char computed_hash[65] = {0};
-                                 computer_sha256(password, computed_hash);
-//debug
-                                printf("\n[DEBUG] Username received: '%s' (Expected: '%s')\n", userna>
-                                printf("[DEBUG] Computed Hash: '%s'\n", computed_hash);
-                                printf("[DEBUG] Expected Hash: '%s'\n\n", VALID_PASSWORD_HASH);
+                                 computer_sha256_with_salt(password,SALT, computed_hash);
 
+
+
+                                        printf("\n[DEBUG] Username received: '%s'\n", username);
+                                        printf("[DEBUG] Salt used: '%s'\n", SALT);
+                                        printf("[DEBUG] Salted Computed Hash: '%s'\n", computed_hash);
+                                        printf("[DEBUG] Expected Hash: '%s'\n\n", VALID_PASSWORD_HASH>
 
 
 
                                 if (strcmp(username, VALID_USERNAME) == 0 && strcmp(computed_hash,VAL>
+                                        //reset when connection succsided
+                                        pthread_mutex_lock(&auth_lock_mutex);
+                                        failed_attempts = 0;
+                                        pthread_mutex_unlock(&auth_lock_mutex);
+
                                         is_authenticated = 1;
                                         char *reply = "200 SUCCESS: Authenticated successfully!\n";
                                         send(new_socket, reply, strlen(reply), 0);
 
                                         snprintf(log_buff, sizeof(log_buff), "User '%s' authenticated>
-                                                                                 log_event("INFO", log_buff);
+                                        log_event("INFO", log_buff);
                                 }else{
-                                        is_authenticated = 0;
-                                        char *reply = "Invalid username or password/n";
-                                        send(new_socket, reply, strlen(reply), 0);
+                                        // dealing with failed attempts
+                                        pthread_mutex_lock(&auth_lock_mutex);
+                                        failed_attempts++;
 
-                                        snprintf(log_buff, sizeof(log_buff), "SECURITY ALLERT: Failed>
-                                        ,username, new_socket);
+                                        //check if lock
+                                        if (failed_attempts >= MAX_FAILED_ATTEMPTS){
+                                                lockout_start_time = time(NULL);
+                                                snprintf(log_buff, sizeof(log_buff), "SECURITY ALERT:>
+                                                         MAX_FAILED_ATTEMPTS, LOCKOUT_TIME_SEC);
+                                                log_event("WARNING", log_buff);
+                                        }else{
+                                        snprintf(log_buff,sizeof(log_buff),"SECURITY WARNING: Failed >
+                                                         failed_attempts, MAX_FAILED_ATTEMPTS, userna>
                                         log_event("WARNING", log_buff);
+                                        }
+                                        pthread_mutex_unlock(&auth_lock_mutex);
+
+                                        is_authenticated = 0;
+                                        char reply[128];
+                                        //showing how many attempts
+                                        snprintf(reply, sizeof(reply), "401 UNAUTHORIZED: Invalid cre>
+                                                         failed_attempts, MAX_FAILED_ATTEMPTS);
+                                        send(new_socket, reply, strlen(reply),0);
                                 }
                         } else{
                                 char *reply = "401 UNAUTHORIZED: Invalid credentials!\n";
@@ -159,7 +227,6 @@ void *handle_client(void *client_socket_ptr){
                 char *reply = "PONG!\n";
                 send(new_socket, reply, strlen(reply), 0);
                 }
-
             } else if (strncmp(buffer, "TIME", 4) == 0) {
                 if (!is_authenticated){
                         char *reply = "FORBIDDEN: Please LOGIN first\n";
@@ -180,8 +247,8 @@ void *handle_client(void *client_socket_ptr){
             }
 
         } else if (bytes_read == 0) {
-                snprintf(log_buff, sizeof(log_buff),"Socket %d disconnected gracefully.\n", new_socke);
-             log_event("INFO", log_buff);
+                snprintf(log_buff, sizeof(log_buff),"Socket %d disconnected gracefully.\n", new_socke>
+                log_event("INFO", log_buff);
                 break;
         } else {
             perror("Recv failed");
@@ -226,6 +293,8 @@ int main(){
                 exit(EXIT_FAILURE);
         }
         printf("[*] Multi-threaded server listing on port %d...\n", PORT);
+
+
 // Listen
         if (listen(server_fd, 10) < 0) {
                 perror("Listen failed");
@@ -263,7 +332,6 @@ int main(){
         }
 close(server_fd);
 return 0;
-
 
 
 
